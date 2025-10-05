@@ -12,36 +12,32 @@ halt_exploration_prob: 0.1
 
 # --- 모듈별 아키텍처 하이퍼파라미터 ---
 frontal_module:
-  num_layers: 6
-  hidden_size: 128
-  num_heads: 2
+  num_layers: 3
+  hidden_size: 512
+  num_heads: 16
   expansion: 4
 
 thalamus_module:
-  hidden_size: 256
-  num_layers: 3
-
-H_cycles: 4
-L_cycles: 4
+  hidden_size: 512
+  num_layers: 2
 
 reasoning_module:
   num_layers: 1      # 각 추론 모듈 내부의 트랜스포머 레이어 수
-  hidden_size: 128
+  hidden_size: 32
   num_heads: 2
   expansion: 4
-  inner_loops: 0   # 활성 추론 모듈의 내부 재귀 연산 횟수
+  inner_loops: 5     # 활성 추론 모듈의 내부 재귀 연산 횟수
 
 # --- 공통 Transformer 파라미터 ---
 pos_encodings: rope
 
 # --- 동적 성장 메커니즘 하이퍼파라미터 ---
-initial_modules: 1                 # 시작 시 추론 모듈의 개수
+initial_modules: 2                 # 시작 시 추론 모듈의 개수
 max_modules: 8                     # 최대 추론 모듈의 개수
-convergence_check_interval: 1000   # 시스템 수렴 상태를 확인할 주기 (훈련 스텝)
+convergence_check_interval: 500   # 시스템 수렴 상태를 확인할 주기 (훈련 스텝)
 stable_threshold: 5e-8           # 수렴으로 판단할 그래디언트 분산의 임계값
 rate_hardprob: 0.2 #0.2               # 고난도 문제로 정의할 상위 n% (0.15 = 15%)
 stabilization_duration: 7000       # 새 모듈 추가 후 안정화 학습을 진행할 기간 (훈련 스텝)
-pretrain_steps_for_first_module: 7000
 
 # --- 적응 학습 (Adaptive Learning) 메커니즘 하이퍼파라미터 ---
 adaptive_learning:

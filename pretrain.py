@@ -170,7 +170,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         module_activation_counts=[0] * initial_module_count
     )
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, progress_bar: Optional[tqdm.tqdm] = None):
     if global_batch_size == 0: return None
 
     train_state.step += 1
@@ -191,65 +191,105 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     
     input_embeddings = train_state.model.model.inner._input_embeddings(current_carry.current_data["inputs"])
     num_modules = len(train_state.model.model.inner.reasoning_modules)
-    predicted_errors = train_state.model.model.inner.thalamus_module(z_f_t, input_embeddings)[:, :num_modules]
-    
-    with torch.no_grad():
-        if train_state.is_in_stabilization_phase:
-            min_predicted_error_this_step = torch.min(predicted_errors[:, :-1]).item()
-        else:
-            min_predicted_error_this_step = torch.min(predicted_errors).item()
-
-    gating_logits = -predicted_errors
-
-    if train_state.is_in_stabilization_phase and num_modules > 1:
-        with torch.no_grad():
-            existing_module_errors = predicted_errors[:, :-1]
-            active_module_idx_among_existing = torch.argmin(existing_module_errors, dim=1)
-            difficulty = torch.min(existing_module_errors, dim=1).values
-            sorted_indices = torch.argsort(difficulty, descending=True)
-            num_hard_problems = int(len(difficulty) * arch_config['rate_hardprob'])
-            hard_problem_indices = sorted_indices[:num_hard_problems]
-            new_module_idx = num_modules - 1
-            active_module_idx = active_module_idx_among_existing
-            active_module_idx[hard_problem_indices] = new_module_idx
-    else:
-        logits_for_sampling = gating_logits.clone()
-        if train_state.is_in_adaptive_phase and num_modules > 1:
-            adaptive_config = arch_config['adaptive_learning']
-            logits_for_sampling[:, -1] += adaptive_config['new_module_bonus']
-        
-        probs = F.softmax(logits_for_sampling, dim=-1)
-        active_module_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-    if config.verbose > 0:
-        unique_indices, counts = torch.unique(active_module_idx, return_counts=True)
-        for idx, count in zip(unique_indices.tolist(), counts.tolist()):
-            train_state.module_activation_counts[idx] += count
-
     cos_sin = train_state.model.model.inner.rotary_emb() if hasattr(train_state.model.model.inner, "rotary_emb") else None
     
-    all_z_r_a_t_plus_1 = torch.empty_like(z_r_states_t[0])
-    updated_z_r_states = list(z_r_states_t) 
+    min_predicted_error_this_step = float('inf')
+    gating_logits_list = []
+    active_module_indices_list = []
+    
+    H_cycles = arch_config.get('H_cycles', 1)
+    L_cycles = arch_config.get('L_cycles', 1)
 
-    for i in range(num_modules):
-        mask = (active_module_idx == i)
-        if not mask.any():
-            continue
+    for _h in range(H_cycles):
+        if num_modules == 1:
+            active_module_idx = torch.zeros(z_f_t.shape[0], dtype=torch.long, device=device)
+        else:
+            predicted_errors = train_state.model.model.inner.thalamus_module(z_f_t, input_embeddings)[:, :num_modules]
+            with torch.no_grad():
+                 min_predicted_error_this_step = min(min_predicted_error_this_step, torch.min(predicted_errors).item())
+            gating_logits = -predicted_errors
+            
+            if train_state.is_in_stabilization_phase:
+                 with torch.no_grad():
+                    existing_module_errors = predicted_errors[:, :-1]
+                    active_module_idx_among_existing = torch.argmin(existing_module_errors, dim=1)
+                    difficulty = torch.min(existing_module_errors, dim=1).values
+                    sorted_indices = torch.argsort(difficulty, descending=True)
+                    num_hard_problems = int(len(difficulty) * arch_config.get('rate_hardprob', 0.15))
+                    hard_problem_indices = sorted_indices[:num_hard_problems]
+                    new_module_idx = num_modules - 1
+                    active_module_idx = active_module_idx_among_existing
+                    active_module_idx[hard_problem_indices] = new_module_idx
+            else:
+                logits_for_sampling = gating_logits.clone()
+                if train_state.is_in_adaptive_phase:
+                    adaptive_config = arch_config.get('adaptive_learning', {})
+                    bonus = adaptive_config.get('new_module_bonus', 0.0)
+                    logits_for_sampling[:, -1] += bonus
+                
+                probs = F.softmax(logits_for_sampling, dim=-1)
+                active_module_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            gating_logits_list.append(gating_logits)
+            active_module_indices_list.append(active_module_idx)
+            
+        z_r_active = torch.empty_like(z_r_states_t[0])
+        for i in range(num_modules):
+            mask = (active_module_idx == i)
+            if not mask.any(): continue
+            z_r_active[mask] = z_r_states_t[i][mask]
+
+        with torch.no_grad():
+            for _l in range(L_cycles - 1):
+                next_z_r_active = z_r_active.clone()
+                for i in range(num_modules):
+                    mask = (active_module_idx == i)
+                    if not mask.any(): continue
+                    next_z_r_active[mask] = train_state.model.model.inner.reasoning_modules[i](
+                        z_r_active[mask], z_f_t[mask], input_embeddings[mask], cos_sin=cos_sin
+                    )
+                z_r_active = next_z_r_active
         
-        z_r_input = z_r_states_t[i][mask]
-        z_f_input = z_f_t[mask]
-        emb_input = input_embeddings[mask]
-        
-        z_r_a_i_t_plus_1 = train_state.model.model.inner.reasoning_modules[i](
-            z_r_input, z_f_input, emb_input, cos_sin=cos_sin
+        if L_cycles > 0:
+            next_z_r_active = z_r_active.clone()
+            for i in range(num_modules):
+                mask = (active_module_idx == i)
+                if not mask.any(): continue
+                next_z_r_active[mask] = train_state.model.model.inner.reasoning_modules[i](
+                    z_r_active[mask], z_f_t[mask], input_embeddings[mask], cos_sin=cos_sin
+                )
+            z_r_active = next_z_r_active
+
+        for i in range(num_modules):
+            mask = (active_module_idx == i)
+            if not mask.any(): continue
+            z_r_states_t[i] = torch.where(mask.view(-1, 1, 1), z_r_active, z_r_states_t[i])
+
+        z_f_t = train_state.model.model.inner.frontal_module(
+            z_f_t, z_r_active, cos_sin=cos_sin
         )
-        all_z_r_a_t_plus_1[mask] = z_r_a_i_t_plus_1
         
-        temp_z_r = updated_z_r_states[i].clone()
-        temp_z_r[mask] = z_r_a_i_t_plus_1.detach()
-        updated_z_r_states[i] = temp_z_r
+# ... (기존 코드)
+    # H_cycles 루프가 여기서 끝납니다.
+    # ...
+    z_f_t = train_state.model.model.inner.frontal_module(
+        z_f_t, z_r_active, cos_sin=cos_sin
+    )
 
-    z_f_t_plus_1 = train_state.model.model.inner.frontal_module(z_f_t, all_z_r_a_t_plus_1, cos_sin=cos_sin)
+    # --- 💡 여기에 새로운 카운팅 코드를 추가하세요! ---
+    with torch.no_grad():
+        # H_cycles 동안 누적된 모든 모듈 선택 기록을 순회합니다.
+        for active_idx_tensor in active_module_indices_list:
+            # 각 H_cycle의 선택 결과를 바탕으로 카운트를 누적합니다.
+            for i in range(num_modules):
+                count = (active_idx_tensor == i).sum().item()
+                train_state.module_activation_counts[i] += count
+    # ---------------------------------------------------
+
+    z_f_t_plus_1 = z_f_t
+    updated_z_r_states = [s.detach() for s in z_r_states_t]
+# ... (이하 코드 동일)
+    z_f_t_plus_1 = z_f_t
+    updated_z_r_states = [s.detach() for s in z_r_states_t]
     
     final_logits = train_state.model.model.inner.lm_head(z_f_t_plus_1)
     q_logits = train_state.model.model.inner.q_head(z_f_t_plus_1[:, 0, :])
@@ -257,49 +297,44 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     
     current_carry.steps += 1
     with torch.no_grad():
-        is_last_step = current_carry.steps >= arch_config['halt_max_steps']
+        is_last_step = current_carry.steps >= arch_config.get('halt_max_steps', 16)
         halted = is_last_step | (q_halt_logits > q_continue_logits)
-        min_halt_steps = (torch.rand_like(q_halt_logits) < arch_config['halt_exploration_prob']) * torch.randint_like(current_carry.steps, low=2, high=arch_config['halt_max_steps'] + 1)
+        min_halt_steps = (torch.rand_like(q_halt_logits) < arch_config.get('halt_exploration_prob', 0.1)) * torch.randint_like(current_carry.steps, low=2, high=arch_config.get('halt_max_steps', 16) + 1)
         current_carry.halted = halted & (current_carry.steps >= min_halt_steps)
 
     lm_q_loss, metrics, lm_loss_per_seq = train_state.model(
         carry=current_carry, final_logits=final_logits, q_halt_logits=q_halt_logits, q_continue_logits=q_continue_logits
     )
     
-    # ==================== 수정된 부분 시작 ====================
-    # 'reward' 변수를 기본값으로 초기화하여 UnboundLocalError를 방지합니다.
     reward = torch.tensor(0.0, device=device)
-    # ==================== 수정된 부분 끝 ======================
+    gating_loss = torch.tensor(0.0, device=device)
 
-    # BUG FIX: 안정화 단계에서는 시상 모듈의 학습을 중단하여 편견 주입을 방지
-    if train_state.is_in_stabilization_phase:
-        gating_loss = torch.tensor(0.0, device=device)
-    else:
+    if num_modules > 1 and not train_state.is_in_stabilization_phase:
         with torch.no_grad():
-            rl_config = arch_config['gating_rl']
+            rl_config = arch_config.get('gating_rl', {})
+            decay = rl_config.get('reward_baseline_decay', 0.99)
+            scaling = rl_config.get('reward_scaling', 1.0)
             batch_reward_mean = lm_loss_per_seq.mean().item()
-            if train_state.step <= 1 or not train_state.is_in_adaptive_phase: # 첫 스텝 또는 새 모듈 추가 직후 baseline 초기화
-                train_state.reward_baseline = batch_reward_mean
-            else:
-                decay = rl_config['reward_baseline_decay']
-                train_state.reward_baseline = decay * train_state.reward_baseline + (1 - decay) * batch_reward_mean
-            
-            reward = (train_state.reward_baseline - lm_loss_per_seq) * rl_config['reward_scaling']
+            train_state.reward_baseline = decay * train_state.reward_baseline + (1 - decay) * batch_reward_mean
+            reward = (train_state.reward_baseline - lm_loss_per_seq) * scaling
+        
+        for i in range(len(gating_logits_list)):
+            log_probs = F.log_softmax(gating_logits_list[i], dim=-1)
+            chosen_action_log_prob = log_probs.gather(1, active_module_indices_list[i].unsqueeze(-1)).squeeze(-1)
+            gating_loss += (-chosen_action_log_prob * reward.detach()).mean()
+        
+        if len(gating_logits_list) > 0:
+            gating_loss /= len(gating_logits_list)
 
-        log_probs = F.log_softmax(gating_logits, dim=-1)
-        chosen_action_log_prob = log_probs.gather(1, active_module_idx.unsqueeze(-1)).squeeze(-1)
-
-        gating_loss = (-chosen_action_log_prob * reward.detach()).mean()
-    
     total_loss = lm_q_loss + gating_loss
-    
     total_loss.backward()
 
-    with torch.no_grad():
-        gate_grads = [p.grad for p in train_state.model.model.inner.thalamus_module.parameters() if p.grad is not None]
-        if gate_grads:
-            current_grad_variance = torch.var(torch.cat([g.view(-1) for g in gate_grads])).item()
-            train_state.gating_grad_variances.append(current_grad_variance)
+    if num_modules > 1:
+        with torch.no_grad():
+            gate_grads = [p.grad for p in train_state.model.model.inner.thalamus_module.parameters() if p.grad is not None]
+            if gate_grads:
+                current_grad_variance = torch.var(torch.cat([g.view(-1) for g in gate_grads])).item()
+                train_state.gating_grad_variances.append(current_grad_variance)
 
     if world_size > 1:
         for param in train_state.model.parameters():
@@ -308,69 +343,90 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
-        
-        soft_update_frontal = train_state.is_in_stabilization_phase and (num_modules - 1) in active_module_idx
-
         for param_group in optim.param_groups:
-            if param_group['name'] == 'frontal_module' and soft_update_frontal:
-                param_group['lr'] = lr_this_step * 0.1
-            else:
-                param_group['lr'] = lr_this_step
-                
+            param_group['lr'] = lr_this_step
         optim.step()
         optim.zero_grad()
 
     with torch.no_grad():
         current_carry.inner_carry.z_f = z_f_t_plus_1.detach()
-        current_carry.inner_carry.z_r_states = [s.detach() for s in updated_z_r_states]
+        current_carry.inner_carry.z_r_states = updated_z_r_states
 
-    train_state.min_predicted_errors.append(min_predicted_error_this_step)
+    if num_modules > 1 and min_predicted_error_this_step != float('inf'):
+        train_state.min_predicted_errors.append(min_predicted_error_this_step)
     
     if train_state.is_in_stabilization_phase:
         train_state.stabilization_steps_left -= 1
         if train_state.stabilization_steps_left <= 0:
             train_state.is_in_stabilization_phase = False
-            train_state.system_converged = False 
-            train_state.gating_grad_variances.clear()
-            
-            adaptive_config = arch_config['adaptive_learning']
             train_state.is_in_adaptive_phase = True
-            train_state.adaptive_steps_left = adaptive_config['duration']
-            if rank == 0: print(f"\nStep {train_state.step}: Stabilization phase finished. Starting Adaptive Learning phase for {adaptive_config['duration']} steps.")
-
+            adaptive_config = arch_config.get('adaptive_learning', {})
+            duration = adaptive_config.get('duration', 0)
+            train_state.adaptive_steps_left = duration
+            if rank == 0: print(f"\nStep {train_state.step}: Stabilization phase finished. Starting Adaptive Learning phase for {duration} steps.")
     elif train_state.is_in_adaptive_phase:
         train_state.adaptive_steps_left -= 1
         if train_state.adaptive_steps_left <= 0:
             train_state.is_in_adaptive_phase = False
             if rank == 0: print(f"\nStep {train_state.step}: Adaptive Learning phase finished.")
 
-    elif not train_state.is_in_stabilization_phase and not train_state.is_in_adaptive_phase and num_modules < arch_config['max_modules'] and train_state.step > 0 and train_state.step % arch_config['convergence_check_interval'] == 0:
-        if len(train_state.gating_grad_variances) > 0:
-            avg_grad_variance = np.mean(list(train_state.gating_grad_variances))
-            if avg_grad_variance < arch_config['stable_threshold']:
-                if rank == 0:
-                    print(f"\nStep {train_state.step}: System converged with avg grad variance {avg_grad_variance:.2E}")
-                
-                errors_np = np.array(list(train_state.min_predicted_errors))
-                train_state.hard_problem_threshold = np.percentile(errors_np, (1 - arch_config['rate_hardprob']) * 100)
-                
-                if train_state.model.model.inner.add_new_reasoning_module():
-                    train_state.is_in_stabilization_phase = True
-                    train_state.stabilization_steps_left = arch_config['stabilization_duration']
-                    train_state.module_activation_counts.append(0)
-                    with torch.no_grad():
-                        new_z_r = torch.zeros_like(train_state.carry.inner_carry.z_r_states[0])
-                        train_state.carry.inner_carry.z_r_states.append(new_z_r)
+    pretrain_steps = arch_config.get('pretrain_steps_for_first_module', 10000)
+    should_grow_from_pretrain = (num_modules == 1 and train_state.step >= pretrain_steps and not train_state.is_in_stabilization_phase)
+    
+    should_grow_from_convergence = False
+    if num_modules > 1 and not train_state.is_in_stabilization_phase and not train_state.is_in_adaptive_phase:
+        if train_state.step > 0 and train_state.step % arch_config.get('convergence_check_interval', 1000) == 0:
+            if len(train_state.gating_grad_variances) > 0:
+                avg_grad_variance = np.mean(list(train_state.gating_grad_variances))
+                if avg_grad_variance < arch_config.get('stable_threshold', 1e-5):
+                    should_grow_from_convergence = True
+
+    if num_modules < arch_config.get('max_modules', 8) and (should_grow_from_pretrain or should_grow_from_convergence):
+        if rank == 0:
+            if should_grow_from_pretrain:
+                print(f"\nStep {train_state.step}: First module pre-training finished. Adding a new module.")
+            else:
+                print(f"\nStep {train_state.step}: System converged. Adding a new module.")
+
+        if len(train_state.min_predicted_errors) > 0:
+            errors_np = np.array(list(train_state.min_predicted_errors))
+            train_state.hard_problem_threshold = np.percentile(errors_np, (1 - arch_config.get('rate_hardprob', 0.15)) * 100)
+        
+        if train_state.model.model.inner.add_new_reasoning_module():
+            new_module = train_state.model.model.inner.reasoning_modules[-1]
+            optimizer = train_state.optimizers[0]
+            other_modules_config = next((g for g in optimizer.param_groups if g.get('name') == 'other_modules'), None)
+            
+            if other_modules_config:
+                optimizer.add_param_group({
+                    'params': new_module.parameters(), 'name': 'other_modules', 'lr': lr_this_step if lr_this_step is not None else config.lr,
+                    'weight_decay': other_modules_config['weight_decay'], 'betas': other_modules_config['betas']
+                })
+                if rank == 0: print(f"Successfully added new module parameters to the optimizer.")
+            
+            train_state.is_in_stabilization_phase = True
+            train_state.stabilization_steps_left = arch_config.get('stabilization_duration', 2000)
+            train_state.module_activation_counts.append(0)
+            with torch.no_grad():
+                new_z_r = torch.zeros_like(train_state.carry.inner_carry.z_r_states[0])
+                train_state.carry.inner_carry.z_r_states.append(new_z_r)
 
     if config.verbose > 0 and train_state.step % config.verbose == 0 and rank == 0:
-        total_activations = sum(train_state.module_activation_counts)
-        if total_activations > 0:
-            print(f"\n--- Module Activation Frequency (Steps {train_state.step - config.verbose + 1}-{train_state.step}) ---")
-            for i, count in enumerate(train_state.module_activation_counts):
-                percentage = (count / total_activations) * 100
-                print(f"    Module {i}: {count} activations ({percentage:.2f}%)")
-            print("----------------------------------------------------")
-        train_state.module_activation_counts = [0] * len(train_state.module_activation_counts)
+        if progress_bar is not None:
+            total_activations = sum(train_state.module_activation_counts)
+            if total_activations > 0:
+                output = ""
+                if train_state.gating_grad_variances:
+                    avg_grad_variance = np.mean(list(train_state.gating_grad_variances))
+                    output += f"\nStep {train_state.step}: Avg Grad Variance: {avg_grad_variance:.2E}\n"
+                
+                output += f"--- Module Activation Frequency (Steps {train_state.step - config.verbose + 1}-{train_state.step}) ---\n"
+                for i, count in enumerate(train_state.module_activation_counts):
+                    percentage = (count / total_activations) * 100
+                    output += f"    Module {i}: {count} activations ({percentage:.2f}%)"
+                progress_bar.write(output)
+
+            train_state.module_activation_counts = [0] * len(train_state.module_activation_counts)
 
     if rank == 0:
         count = metrics.get("count", 1.0).item()
@@ -385,27 +441,22 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             "train/lr": lr_this_step,
             "train/current_module_count": num_modules,
             "train/hard_problem_threshold": train_state.hard_problem_threshold,
-            "train/min_predicted_error": min_predicted_error_this_step,
+            "train/min_predicted_error": min_predicted_error_this_step if min_predicted_error_this_step != float('inf') else -1.0,
         }
         
-        # BUG FIX: 안정화 단계에서는 gating 관련 지표를 로깅하지 않도록 수정
-        if not train_state.is_in_stabilization_phase:
-            # 안정화 단계가 아닐 때만 gating loss 및 강화학습 관련 지표들을 추가합니다.
-            reduced_metrics["train/gating_loss"] = gating_loss.item() / global_batch_size
-            
+        if not train_state.is_in_stabilization_phase and num_modules > 1:
+            reduced_metrics["train/gating_loss"] = gating_loss.item()
             with torch.no_grad():
-                # 1. 평균 보상
                 reduced_metrics["train/gating/reward"] = reward.mean().item()
-                
-                # 2. 정책 엔트로피
-                probs_for_entropy = F.softmax(gating_logits, dim=-1)
-                entropy = (-torch.sum(probs_for_entropy * torch.log(probs_for_entropy + 1e-9), dim=-1)).mean().item()
-                reduced_metrics["train/gating/policy_entropy"] = entropy
+                if gating_logits_list:
+                    last_gating_logits = gating_logits_list[-1]
+                    probs_for_entropy = F.softmax(last_gating_logits, dim=-1)
+                    entropy = (-torch.sum(probs_for_entropy * torch.log(probs_for_entropy + 1e-9), dim=-1)).mean().item()
+                    reduced_metrics["train/gating/policy_entropy"] = entropy
 
-                # 3. 각 모듈의 평균 선택 확률
-                mean_probs = probs_for_entropy.mean(dim=0)
-                for i in range(num_modules):
-                    reduced_metrics[f"train/gating/module_{i}_prob"] = mean_probs[i].item()
+                    mean_probs = probs_for_entropy.mean(dim=0)
+                    for i in range(num_modules):
+                        reduced_metrics[f"train/gating/module_{i}_prob"] = mean_probs[i].item()
 
         if train_state.gating_grad_variances:
             reduced_metrics["train/gating_grad_variance"] = train_state.gating_grad_variances[-1]
@@ -425,7 +476,7 @@ def evaluate(config: PretrainConfig, model: nn.Module, eval_loader: torch.utils.
             
             z_f_t_plus_1 = carry.inner_carry.z_f
 
-            for t in range(arch_config['halt_max_steps']):
+            for t in range(arch_config.get('halt_max_steps', 16)):
                 z_f_t = carry.inner_carry.z_f
                 z_r_states_t = carry.inner_carry.z_r_states
                 
@@ -552,6 +603,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
+    
     mp.set_start_method("spawn", force=True)
     RANK, WORLD_SIZE = 0, 1
     if "LOCAL_RANK" in os.environ:
@@ -563,7 +615,7 @@ def launch(hydra_config: DictConfig):
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
     torch.manual_seed(config.seed + RANK)
     np.random.seed(config.seed + RANK)
-
+ 
     train_loader, train_metadata = create_dataloader(config, "train", rank=RANK, world_size=WORLD_SIZE)
     
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
@@ -572,7 +624,7 @@ def launch(hydra_config: DictConfig):
     eval_process = None
     metrics_queue = None
 
-    steps_per_epoch = int(train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
+    steps_per_epoch = int(train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size) if config.global_batch_size > 0 else 1
 
     if rank_zero_only():
         progress_bar = tqdm.tqdm(total=train_state.total_steps, desc="Training")
@@ -586,15 +638,15 @@ def launch(hydra_config: DictConfig):
     for _, batch, global_batch_size_effective in train_loader:
         if train_state.step >= train_state.total_steps: break
         
-        if RANK == 0 and not metrics_queue.empty():
+        if RANK == 0 and metrics_queue is not None and not metrics_queue.empty():
             step, epoch, eval_metrics = metrics_queue.get()
             eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
             wandb.log(eval_metrics_with_epoch, step=step)
             print(f"Evaluation results from epoch {epoch} logged.")
 
-        metrics = train_batch(config, train_state, batch, global_batch_size_effective, rank=RANK, world_size=WORLD_SIZE)
+        metrics = train_batch(config, train_state, batch, global_batch_size_effective, rank=RANK, world_size=WORLD_SIZE, progress_bar=progress_bar)
         
-        current_epoch = (train_state.step -1) // steps_per_epoch + 1
+        current_epoch = (train_state.step -1) // steps_per_epoch + 1 if steps_per_epoch > 0 else 1
         train_state.epoch = current_epoch
         
         if rank_zero_only() and metrics is not None:
@@ -608,21 +660,24 @@ def launch(hydra_config: DictConfig):
 
             model_state_cpu = {k: v.cpu() for k, v in train_state.model.state_dict().items()}
 
-            eval_process = mp.Process(target=evaluate_worker, args=(
-                RANK, WORLD_SIZE, config, model_state_cpu, train_state.step, current_epoch, metrics_queue
-            ))
-            eval_process.start()
+            if metrics_queue is not None:
+                eval_process = mp.Process(target=evaluate_worker, args=(
+                    RANK, WORLD_SIZE, config, model_state_cpu, train_state.step, current_epoch, metrics_queue
+                ))
+                eval_process.start()
             
             if config.checkpoint_every_eval:
                 save_train_state(config, train_state)
     
     if rank_zero_only():
-        progress_bar.close()
-        while not metrics_queue.empty():
-            step, epoch, eval_metrics = metrics_queue.get()
-            eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
-            wandb.log(eval_metrics_with_epoch, step=step)
-            print(f"Final evaluation results from epoch {epoch} logged.")
+        if progress_bar is not None:
+            progress_bar.close()
+        if metrics_queue is not None:
+            while not metrics_queue.empty():
+                step, epoch, eval_metrics = metrics_queue.get()
+                eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
+                wandb.log(eval_metrics_with_epoch, step=step)
+                print(f"Final evaluation results from epoch {epoch} logged.")
         save_train_state(config, train_state)
     
     if eval_process is not None:
