@@ -52,10 +52,6 @@ HRM과 ERM의 아키텍쳐에서 차이점은 단 두 가지다. 첫째로, L-le
 ## 실험 결과(실패 분석)
 
 하이퍼파라미터들을 이래저래 조정하고 게이팅 라우터 옵션도 바꿔가며 실험을 해봤는데 다음과 같은 일관적인 결과를 얻을 수 있었다.
-
-![image](https://github.com/user-attachments/assets/4d270211-f6a0-4c4d-95d4-4f7e823ef205)
-![image](https://github.com/user-attachments/assets/17b71272-afa4-4b29-95b9-9b7ec58ae89a)
-![image](https://github.com/user-attachments/assets/6e9db79a-905b-4d7c-9360-55fca255d777)
 1. 불안정한 성능.
 
 직접 HRM을 학습해 본 결과 HRM의 학습 그래프는 다음과 같이 유사도와 정확도가 함께 안정적으로 상승하며 학습되는 양상을 보인다
@@ -63,6 +59,10 @@ HRM과 ERM의 아키텍쳐에서 차이점은 단 두 가지다. 첫째로, L-le
 ![image](https://github.com/user-attachments/assets/bf8c12c3-29b6-49a9-a566-db23a77b1da0)
 
 반면, 내가 고안한 아키텍처는 어떤 옵션에도 저렇게 안정적인 분산으로 정확도와 유사도가 함께 오르지 않았다. 불안정한 구조 탓인지 전반적인 그래디언트의 분산도 훨씬 컸고 사실상 학습에 실패했다. 
+
+![image](https://github.com/user-attachments/assets/4d270211-f6a0-4c4d-95d4-4f7e823ef205)
+![image](https://github.com/user-attachments/assets/17b71272-afa4-4b29-95b9-9b7ec58ae89a)
+![image](https://github.com/user-attachments/assets/6e9db79a-905b-4d7c-9360-55fca255d777)
 
 2. reason 모듈 고착화
 
