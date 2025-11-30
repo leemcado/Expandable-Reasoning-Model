@@ -1,7 +1,7 @@
 
 ## 개요 
 
-![[Pasted image 20251130070132.png]]
+
 ![image](https://github.com/user-attachments/assets/286594d7-d6b4-4a3e-85ec-af8a87fcc203)
 HRM모델을 고안한 Sapient Intelligence는 HRM모델이 ARC류 문제에 우수한 근거 중 하나로 다음과 같이 주장한다:  "H, L모듈간 학습 빈도로 인한 창발적인 역할 차이"
 
@@ -12,7 +12,6 @@ HRM모델을 고안한 Sapient Intelligence는 HRM모델이 ARC류 문제에 우
 
 ## 아키텍처
 
-![[Pasted image 20251130064708.png]]
 ![image](https://github.com/user-attachments/assets/4d6e9225-b0e6-4a4e-87d8-f4ace0523e05)
 아키텍처는 위와 같다. 기존 HRM에서의 H모듈을 Frontal Module이라고 재정의하고, L모듈을 Reason Module이라고 재정의한다. 
 
@@ -23,7 +22,7 @@ $$z_{r'}^{(t+1)}=f_{r'}(z_{r'}^{(t)}+z_f^{(t)}+input\_embedding)\ \ (r'는\ 활�
 $$z_f^{(t+1)}=f_f(z_{r'}^{(t)}+z_f^{(t)})$$
 
 마찬가지로, HRM과 같은 input, output 모델 구조를 공유하고 HRM과 같은 H-L Cycle 메커니즘과 1-step BPTT 방식을 공유한다. 
-![[Pasted image 20251130163428.png]]
+
 ![image](https://github.com/user-attachments/assets/653cdfd1-11d2-42e4-8e10-c39da7ea4b39)
 
 HRM과 ERM의 아키텍쳐에서 차이점은 단 두 가지다. 첫째로, L-level 모듈(reason 모듈)이 하나가 아니라 최대 8개까지 존재할 수 있다는 점이다. 이때, 동시에 여러 reason 모듈이 활성화되진 않고 단 하나의 모듈만 활성화되어 기존 HRM의 H-L모듈 상호작용 과정을 해치지 않고, 각 reason모듈이 할당된 문제 상황을 전담할 수 있게 한다.
@@ -54,17 +53,13 @@ HRM과 ERM의 아키텍쳐에서 차이점은 단 두 가지다. 첫째로, L-le
 
 하이퍼파라미터들을 이래저래 조정하고 게이팅 라우터 옵션도 바꿔가며 실험을 해봤는데 다음과 같은 일관적인 결과를 얻을 수 있었다.
 
-![[Pasted image 20251130173234.png]]
-![[Pasted image 20251130173344.png]]
-![[Pasted image 20251130173622.png]]
-
 ![image](https://github.com/user-attachments/assets/4d270211-f6a0-4c4d-95d4-4f7e823ef205)
 ![image](https://github.com/user-attachments/assets/653cdfd1-11d2-42e4-8e10-c39da7ea4b39)
 ![image](https://github.com/user-attachments/assets/6e9db79a-905b-4d7c-9360-55fca255d777)
 1. 불안정한 성능.
 
 직접 HRM을 학습해 본 결과 HRM의 학습 그래프는 다음과 같이 유사도와 정확도가 함께 안정적으로 상승하며 학습되는 양상을 보인다
-![[Pasted image 20251130173738.png]]
+
 ![image](https://github.com/user-attachments/assets/bf8c12c3-29b6-49a9-a566-db23a77b1da0)
 
 반면, 내가 고안한 아키텍처는 어떤 옵션에도 저렇게 안정적인 분산으로 정확도와 유사도가 함께 오르지 않았다. 불안정한 구조 탓인지 전반적인 그래디언트의 분산도 훨씬 컸고 사실상 학습에 실패했다. 
@@ -77,7 +72,6 @@ HRM과 ERM의 아키텍쳐에서 차이점은 단 두 가지다. 첫째로, L-le
 
 1. 복잡한 모델 구조
 
-![[Pasted image 20251130174404.png]]
 ![image](https://github.com/user-attachments/assets/b695cefa-284b-4267-b972-15b7bcd509ee)
 
 이런저런 기능을 추가하려고 한 탓에 하이퍼파라미터가 지나치게 많아졌다.
@@ -99,16 +93,14 @@ ARC문제는 구조적으로 아주 분산이 큰 데이터셋에 속한다. 단
 
 이런 결과를 얻고 회의감 아닌 회의감을 갖고 있는 와중 다음 포스팅들을 보았다. 
 
-![[Pasted image 20251130175351.png]]
 ![image](https://github.com/user-attachments/assets/07a6ec0e-2b72-4c48-a382-fff9b2fbf340)
 
 첫째로 ARC 저자 측이 재현 실험과 비교 실험을 하며 얻은 결과를 포스팅한 블로그다. 대충 요약하자면, HRM이 우수한 이유는 sapientinc측이 주장한 모듈들의 역할 분리가 아닌 한 문제에 관한 결과를 내기까지 수백 번에 달하는 순전파를 통해 정답을 탐색하는 딥 슈퍼비전에 있다는 것이다. 
 
-![[Pasted image 20251130175618.png]]
 ![image](https://github.com/user-attachments/assets/3033636d-3bab-4d24-996c-b309c2877aee)
 
 두 번째론 이런 ARC측의 실험 결과를 입증이라도 하듯 나온 논문 한 편이다. 삼성에서 만든 TRM이라는 논문인데, 내부 모듈을 하나로 줄여 경량화한 대신 HRM의 깊은 내부 추론 루프인 딥 슈퍼비전에 주목해 HRM보다 더 우수한 성능을 얻은 TRM이라는 프로젝트 관련 논문이다. 
-![[Pasted image 20251130175754.png]]
+
 ![image](https://github.com/user-attachments/assets/6525d059-4c0a-4f18-9b74-eed2d17f217f))
 
 심지어 이 논문의 맨 뒷단에 나오는 실패한 아이디어 목록 첫 줄에 MoE방식이 실패했다고 나왔다! 
