@@ -54,7 +54,7 @@ HRM과 ERM의 아키텍쳐에서 차이점은 단 두 가지다. 첫째로, L-le
 하이퍼파라미터들을 이래저래 조정하고 게이팅 라우터 옵션도 바꿔가며 실험을 해봤는데 다음과 같은 일관적인 결과를 얻을 수 있었다.
 
 ![image](https://github.com/user-attachments/assets/4d270211-f6a0-4c4d-95d4-4f7e823ef205)
-![image](https://github.com/user-attachments/assets/653cdfd1-11d2-42e4-8e10-c39da7ea4b39)
+![image](https://github.com/user-attachments/assets/17b71272-afa4-4b29-95b9-9b7ec58ae89a)
 ![image](https://github.com/user-attachments/assets/6e9db79a-905b-4d7c-9360-55fca255d777)
 1. 불안정한 성능.
 
